@@ -56,8 +56,7 @@ def create_argparser():
 # one important thing: if we cannot find variables with user\pass in bamboo globals for KEY -
 # to have an ability to update tasks date we'll assign user and pass for GW and try to do that by GW user
 prj_filters_dict = {
-    'Kanban_name'         : {'FilterID':'FilterID', 'user':'', 'pass':''},
-    'Kanban_name'        : {'FilterID':'FilterID', 'user':'', 'pass':''}
+    'Kanban_name'         : {'FilterID':'FilterID', 'user':'', 'pass':''}
 }
 
 
@@ -115,7 +114,7 @@ def read_params_from_env():
     # below lambda expression is used to pick all elements that have "_devops_" in the env var name
     # after that we should have only pairs like {{example_user, value},{example_password,value}, ...}
     credent_env_dict = dict(filter(lambda element: filter_to_match in element[0], bamboo_env_dict.items()))
-    
+
     #updating data for filters dict
     for ekey,evalue in credent_env_dict.items():
         for key in prj_filters_dict:
@@ -138,6 +137,22 @@ def read_params_from_env():
             prj_filters_dict[key]['user']=prj_filters_dict['GW']['user']
             prj_filters_dict[key]['pass']=prj_filters_dict['GW']['pass']
 
+def read_params_from_env_gitlab():
+    filter_to_match = "DevOps_tasks"
+    devops_user = os.getenv("DevOps_tasks_USER")
+    devops_password = os.getenv("DevOps_tasks_PASSWORD")
+
+    if devops_user:
+        prj_filters_dict['DevOps_tasks']['user'] = devops_user
+        print("Found GitLab variable: DevOps_tasks_USER with value:", devops_user)
+    else:
+        print("Haven't found user for key: DevOps_tasks in GitLab environment variables. Using default - GW")
+
+    if devops_password:
+        prj_filters_dict['DevOps_tasks']['pass'] = devops_password
+        print("Found GitLab variable: DevOps_tasks_PASSWORD with value: No-no-no :)")
+    else:
+        print("Haven't found pass for key: DevOps_tasks in GitLab environment variables. Using default - GW")
 
 #function for debug
 def prj_filters_dict_print():
@@ -193,67 +208,76 @@ def get_jira_tasks_lists(jira_url, filterId, jira_user,jira_pass):
 
 def get_overdue_tasks(jira_url):
     jira_tasks = {}
-    
-    #get current date in format as JIRA uses
+
+    # get current date in the format JIRA uses
     today = date.today()
     print("Today is: " + today.strftime('%Y-%m-%d'))
-    
-    #completed or rejected for filters
-    statuses_fltr = ['Выполнение подтверждено', 'Выполнена', 'Согласовано', 'Отклонено', 'Снято заказчиком']
+
+    statuses_fltr = ['готово', 'обработано', 'ready', 'закрыто', 'закрыт', 'решен', 'mvp', 'canceled', 'cancelled', 'выполнено', 'готово', 'closed', 'done', 'confirmed']
+
+    for k, t in prj_filters_dict.items():
+        jira_tasks[k] = get_jira_tasks_lists(jira_url, t['FilterID'], t['user'], t['pass'])['issues']
+        if jira_tasks[k] is None:
+            jira_tasks[k] = get_jira_tasks_lists(jira_url, prj_filters_dict['GW']['FilterID'], prj_filters_dict['GW']['user'], prj_filters_dict['GW']['pass'])['issues']
 
     overdue_tasks = {}
-
-    for k,t in prj_filters_dict.items():
-        #print(k,t['FilterID'])
-        jira_tasks[k]=get_jira_tasks_lists(jira_url,t['FilterID'],t['user'],t['pass'])['issues']
-        if (jira_tasks[k] == None):
-            jira_tasks[k]=get_jira_tasks_lists(jira_url,prj_filters_dict['GW']['FilterID'],prj_filters_dict['GW']['user'],prj_filters_dict['GW']['pass'])['issues']
-
-        overdue_tasks[k]=[]
-        for item in jira_tasks[k]:
-            # as on some progects they not fill DueDate we should avoid TypeError strptime() argument 1 must be str, not None
+    for key in jira_tasks:
+        overdue_tasks[key] = []
+        for item in jira_tasks[key]:
             try:
-                iss_due = datetime.strptime(item['fields']['duedate'], '%Y-%m-%d').date()
-                if (iss_due <= today) and (item['fields']['status']['name'] not in statuses_fltr):
-                    overdue_tasks[k].append(item)
-            except TypeError:
-                #DueDate is not set, adding item to overdue list update it
-                print("Found issue: " + item['key'] + " '" + item['fields']['summary'] + " that hasn't DueDate at all. Would set DueDate for it")
-                item['fields']['duedate'] = today.strftime('%Y-%m-%d')
-                overdue_tasks[k].append(item)
+                status_name = item['fields']['status']['name'].lower()
+                duedate = item['fields']['duedate']
+                if duedate is not None and status_name not in statuses_fltr and datetime.strptime(duedate, '%Y-%m-%d').date() <= today:
+                    overdue_tasks[key].append(item)
+            except (KeyError, ValueError):
+                pass  # Handle any potential missing keys or date conversion errors
+
     return overdue_tasks
 
-def move_overdue_tasks(jira_url,tasks_list):
+
+def is_weekend(date_obj):
+    return date_obj.weekday() >= 5  # Saturday and Sunday are 5 and 6
+
+def next_working_day(date_obj):
+    while is_weekend(date_obj):
+        date_obj += timedelta(days=1)
+    return date_obj
+
+
+def move_overdue_tasks(jira_url, tasks_list):
     not_moved_jira_tasks = {}
 
-    #current date (work from Python 3.3)
-    new_due = date.today() + timedelta(days=1)
+    # Define a function to calculate the next working day
+    def next_working_day(date_obj):
+        while is_weekend(date_obj):
+            date_obj += timedelta(days=1)
+        return date_obj
 
-    #URL for jira issues updating - '/' at end is important
-    jira_update_rest = jira_url+'/rest/api/2/issue/'
+    new_due_date = next_working_day(date.today() + timedelta(days=1))
 
-    upd_due_json='''{
+    # URL for updating JIRA issues - '/' at the end is important
+    jira_update_rest = jira_url + '/rest/api/2/issue/'
+
+    upd_due_json = '''{
         "fields": {
-            "duedate" : %s
+            "duedate": %s
         }
-    }''' % json.dumps(new_due.strftime('%Y-%m-%d'))
+    }''' % json.dumps(new_due_date.strftime('%Y-%m-%d'))
 
-    #in that list we don't need to check date - all them are outdated
+    # Iterate through tasks and update due dates
     for key in tasks_list.keys():
-        not_moved_jira_tasks[key]=[]
-        problem_items=False
+        not_moved_jira_tasks[key] = []
+        problem_items = False
         for item in tasks_list[key]:
-            call_result = call_jira_api("PUT",jira_update_rest+item['key'], prj_filters_dict[key]['user'],
+            call_result = call_jira_api("PUT", jira_update_rest + item['key'], prj_filters_dict[key]['user'],
                                         prj_filters_dict[key]['pass'], upd_due_json)
-            # for correct request result not none
-            if call_result[0] == None:
-                # если не сработает call_result и мы попадём в это условие, то также захардкодить пользолвателя GW для мува тасков
-                print ("Not updated date for issue: " + str(key) + " with error: " + call_result[1])
+            if call_result[0] is None:
+                print("Not updated date for issue: " + str(key) + " with error: " + call_result[1])
                 not_moved_jira_tasks[key].append(item)
-                problem_items=True
-                print ("Will be using GW user")
-                call_result = call_jira_api("PUT",jira_update_rest+item['key'], prj_filters_dict['GW']['user'],
-                                        prj_filters_dict['GW']['pass'], upd_due_json)
+                problem_items = True
+                print("Will be using GW user")
+                call_result = call_jira_api("PUT", jira_update_rest + item['key'], prj_filters_dict['GW']['user'],
+                                            prj_filters_dict['GW']['pass'], upd_due_json)
         if not problem_items:
             not_moved_jira_tasks.pop(key, None)
 
@@ -269,14 +293,8 @@ def sendMailOverdue(tasks_list, problem_tasks_list):
     message["Subject"] = "Check outdated tasks %s" % str(datetime.today().strftime('%d-%m-%Y'))
     message["From"] = sender_email
     message["To"] = ", ".join(receiver_email)
-    # write the BLOOD plain text part
-    # text = """\
-    # Hi,
-    # Check out the new post on the Mailtrap blog:
-    # SMTP Server for Testing: Cloud-based or Local?
-    # https://blog.mailtrap.io/2018/09/27/cloud-or-local-smtp-server/
-    # Feel free to let us know what content would be useful for you!"""
-    # write the HTML part
+
+    # Define HTML content
     html_prefix = """\
     <html>
     <body>
@@ -293,24 +311,27 @@ def sendMailOverdue(tasks_list, problem_tasks_list):
         </tr>
     """
 
-    html_end_table_overdue ="""
+    html_end_table_overdue = """
         </table>
         <br>
     """
 
-    #we should close HTML tags anyway
-    html_ending="""
+    # We should close HTML tags anyway
+    html_ending = """
         </body>
     </html>
     """
 
-    #creating table body for overdue tasks
-    counter=0
+    # Creating table body for overdue tasks
+    counter = 0
     for key in tasks_list.keys():
         for item in tasks_list[key]:
             counter += 1
-            print("Issue: " + item['key'] + " '" + item['fields']['summary'] + "' dueDate: " + item['fields']['duedate'] + " is out of date")
-            task_html= '''
+            assignee_display_name = item['fields']['assignee']['displayName'] if item['fields']['assignee'] is not None else ""
+            status_name = item['fields']['status']['name'] if item['fields']['status'] is not None else ""
+            duedate = item['fields']['duedate'] if item['fields']['duedate'] is not None else ""
+            print("Issue: " + item['key'] + " '" + item['fields']['summary'] + "' dueDate: " + duedate + " is out of date")
+            task_html = '''
             <tr>
                 <th>%s</th>
                 <th><p><a href="jira_url/%s">%s</a></p></th>
@@ -319,19 +340,19 @@ def sendMailOverdue(tasks_list, problem_tasks_list):
                 <th>%s</th>
                 <th>%s</th>
             </tr>
-            ''' % ( str(counter),
-                    item['key'],
-                    item['key'],
-                    item['fields']['summary'],
-                    item['fields']['assignee']['displayName'],
-                    item['fields']['status']['name'],
-                    item['fields']['duedate']) 
+            ''' % (str(counter),
+                   item['key'],
+                   item['key'],
+                   item['fields']['summary'],
+                   assignee_display_name,
+                   status_name,
+                   duedate)
             html_prefix = html_prefix + task_html
 
     html_prefix = html_prefix + html_end_table_overdue
 
-    #we should close tags anyway, but with different content
-    html_problem_tasks="""
+    # We should close tags anyway, but with different content
+    html_problem_tasks = """
         <table style="width:70%" cellspacing="2" cellpadding="10" border="1">
         <caption>Список заявок, которые не удалось передвинуть</caption>
         <tr>
@@ -344,14 +365,17 @@ def sendMailOverdue(tasks_list, problem_tasks_list):
         </tr>
     """
 
-    counter_err=0
-    #if we have tasks with not changed date - add them in the end of mail
-    if bool (problem_tasks_list):
+    counter_err = 0
+    # If we have tasks with not changed date - add them in the end of mail
+    if bool(problem_tasks_list):
         for key in problem_tasks_list.keys():
             for item in problem_tasks_list[key]:
                 counter_err += 1
-                print("Issue: " + item['key'] + " '" + item['fields']['summary'] + "' dueDate: " + item['fields']['duedate'] + " not moved date")
-                task_html= '''
+                assignee_display_name = item['fields']['assignee']['displayName'] if item['fields']['assignee'] is not None else ""
+                status_name = item['fields']['status']['name'] if item['fields']['status'] is not None else ""
+                duedate = item['fields']['duedate'] if item['fields']['duedate'] is not None else ""
+                print("Issue: " + item['key'] + " '" + item['fields']['summary'] + "' dueDate: " + duedate + " not moved date")
+                task_html = '''
                 <tr>
                     <th>%s</th>
                     <th><p><a href="jira_url/%s">%s</a></p></th>
@@ -360,32 +384,30 @@ def sendMailOverdue(tasks_list, problem_tasks_list):
                     <th>%s</th>
                     <th>%s</th>
                 </tr>
-                ''' % ( str(counter_err),
-                        item['key'],
-                        item['key'],
-                        item['fields']['summary'],
-                        item['fields']['assignee']['displayName'],
-                        item['fields']['status']['name'],
-                        item['fields']['duedate']) 
+                ''' % (str(counter_err),
+                       item['key'],
+                       item['key'],
+                       item['fields']['summary'],
+                       assignee_display_name,
+                       status_name,
+                       duedate)
                 html_problem_tasks = html_problem_tasks + task_html
         html_problem_tasks = html_problem_tasks + html_end_table_overdue
     else:
-        html_problem_tasks="""
+        html_problem_tasks = """
             <p>Срок завершения всех заявок успешно обновлен!<br></p>
         """
 
-    #fully formatted mail
+    # Fully formatted mail
     html_prefix = html_prefix + html_problem_tasks + html_ending
 
-    # convert both parts to MIMEText objects and add them to the MIMEMultipart message
-    #part1 = MIMEText(text, "plain")
+    # Convert both parts to MIMEText objects and add them to the MIMEMultipart message
     part2 = MIMEText(html_prefix, "html")
-    #message.attach(part1)
     message.attach(part2)
-    
-    # send email if we have even one overdue issue
+
+    # Send email if we have even one overdue issue
     if counter > 0:
-        with smtplib.SMTP(host='mail.ru',port='25') as server:
+        with smtplib.SMTP(host='int.bimeister.io', port='25') as server:
             server.sendmail(sender_email, receiver_email, message.as_string())
 
 
@@ -405,7 +427,7 @@ jiraurl=args.jiraurl
 type="GET"
 
 #get users logins and passwords from bamboo global variables
-read_params_from_env()
+read_params_from_env_gitlab()
 prj_filters_dict_print()
 
 overdue_list = get_overdue_tasks(jiraurl)
@@ -416,3 +438,5 @@ if args.movetasks:
     problem_list = move_overdue_tasks(jiraurl,overdue_list)
 
 sendMailOverdue(overdue_list,problem_list)
+print("Все задачи выполнены. Скрипт завершает работу.")
+sys.exit()
